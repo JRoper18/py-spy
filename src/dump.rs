@@ -1,63 +1,87 @@
 use anyhow::Error;
 use console::{style, Term};
+use libc::int32_t;
 
 use crate::config::Config;
 use crate::python_spy::PythonSpy;
 use crate::stack_trace::StackTrace;
-
+use itertools::Itertools;
 use remoteprocess::Pid;
 
-pub fn print_traces(pid: Pid, config: &Config, parent: Option<Pid>) -> Result<(), Error> {
+fn get_stack_traces_with_config(
+    pid: Pid,
+    config: &Config,
+) -> Result<Vec<(PythonSpy, StackTrace)>, Error> {
     let mut process = PythonSpy::new(pid, config)?;
+    let traces = process.get_stack_traces()?;
+    let mut ret: Vec<(PythonSpy, StackTrace)> =
+        traces.into_iter().map(|trace| (process, trace)).collect();
+    let mut subtraces: Vec<(PythonSpy, StackTrace)> = {
+        if config.subprocesses {
+            let sub_results: Result<Vec<Vec<(PythonSpy, StackTrace)>>, Error> = process
+                .process
+                .child_processes()
+                .expect("failed to get subprocesses")
+                .into_iter()
+                .filter_map(|(cpid, ppid)| {
+                    // child_processes() returns the whole process tree, since we're recursing here
+                    // though we could end up printing grandchild processes multiple times. Limit down
+                    // to just once
+                    if ppid == pid {
+                        Some(get_stack_traces_with_config(cpid, config))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            sub_results?.into_iter().flatten().collect()
+        } else {
+            vec![]
+        }
+    };
+
+    ret.append(&mut subtraces);
+    Ok(ret)
+}
+
+pub fn print_traces(pid: Pid, config: &Config, parent: Option<Pid>) -> Result<(), Error> {
+    let process = PythonSpy::new(pid, config)?;
+    let processAndTraces = get_stack_traces_with_config(pid, config)?;
     if config.dump_json {
-        let traces = process.get_stack_traces()?;
+        let traces = processAndTraces
+            .iter()
+            .map(|(spy, traces)| traces)
+            .collect();
         println!("{}", serde_json::to_string_pretty(&traces)?);
         return Ok(());
     }
 
-    println!(
-        "Process {}: {}",
-        style(process.pid).bold().yellow(),
-        process.process.cmdline()?.join(" ")
-    );
+    for (pid, pairs) in processAndTraces.iter().group_by(|(p, t)| p.pid).into_iter() {
+        for (process, trace) in pairs {
+            if first {
+                if let Some(parentpid) = parent {
+                    let parentprocess = remoteprocess::Process::new(parentpid)?;
+                    println!(
+                        "Parent Process {}: {}",
+                        style(parentpid).bold().yellow(),
+                        parentprocess.cmdline()?.join(" ")
+                    );
+                }
+                println!();
+                first = false;
+            }
+            let mut collected_traces: Vec<StackTrace> = trace.collected_traces.reverse();
+            for trace in collected_traces {
+                print_trace(&trace, true);
 
-    println!(
-        "Python v{} ({})",
-        style(&process.version).bold(),
-        style(process.process.exe()?).dim()
-    );
-
-    if let Some(parentpid) = parent {
-        let parentprocess = remoteprocess::Process::new(parentpid)?;
-        println!(
-            "Parent Process {}: {}",
-            style(parentpid).bold().yellow(),
-            parentprocess.cmdline()?.join(" ")
-        );
-    }
-    println!();
-    let traces = process.get_stack_traces()?;
-    for trace in traces.iter().rev() {
-        print_trace(trace, true);
-        if config.subprocesses {
-            for (childpid, parentpid) in process
-                .process
-                .child_processes()
-                .expect("failed to get subprocesses")
-            {
                 let term = Term::stdout();
                 let (_, width) = term.size();
 
                 println!("\n{}", &style("-".repeat(width as usize)).dim());
-                // child_processes() returns the whole process tree, since we're recursing here
-                // though we could end up printing grandchild processes multiple times. Limit down
-                // to just once
-                if parentpid == pid {
-                    print_traces(childpid, config, Some(parentpid))?;
-                }
             }
         }
     }
+
     Ok(())
 }
 
